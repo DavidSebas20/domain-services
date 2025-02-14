@@ -1,12 +1,10 @@
-name: Deploy Microservices on AWS with Incremental Ports
-
+name: Deploy Microservices on AWS with Terraform Integration
 on:
   push:
     branches:
       - Dev
       - QA
       - main
-
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
@@ -29,34 +27,39 @@ jobs:
             docker push dssanguano/${service_name}:${{ github.ref_name }}
           done
 
-  deploy-qa:
-    if: github.ref_name == 'QA'
+  deploy-to-terraform-instance:
+    if: github.ref_name == 'Dev' || github.ref_name == 'QA' || github.ref_name == 'main'
     needs: build-and-push
     runs-on: ubuntu-latest
     steps:
-      # Paso 4: Configurar clave SSH para QA
-      - name: Set up SSH key for QA
+      # Paso 4: Configurar clave SSH para acceder a la instancia EC2 creada con Terraform
+      - name: Set up SSH key for Terraform Instance
         run: |
           mkdir -p /home/runner/.ssh
-          echo "${{ secrets.QA_SSH_KEY }}" > /home/runner/.ssh/qa_key.pem
-          chmod 600 /home/runner/.ssh/qa_key.pem
+          echo "${{ secrets.TERRAFORM_SSH_KEY }}" > /home/runner/.ssh/terraform_key.pem
+          chmod 600 /home/runner/.ssh/terraform_key.pem
 
-      # Paso 5: Desplegar en la instancia QA usando Docker Compose
-      - name: Deploy to QA Instance
+      # Paso 5: Eliminar instancias del Target Group
+      - name: Remove Instances from Target Group
         run: |
-          ssh -o StrictHostKeyChecking=no -i /home/runner/.ssh/qa_key.pem ubuntu@ec2-54-175-100-230.compute-1.amazonaws.com << 'EOF'
-          # Clonar el repositorio en la instancia EC2
-          if [ ! -d "/home/ubuntu/repo" ]; then
-            echo "Cloning repository..."
-            git clone --branch ${{ github.ref_name }} https://github.com/DavidSebas20/domain-security-auth.git /home/ubuntu/repo
-          else
-            echo "Repository already cloned. Pulling latest changes..."
-            cd /home/ubuntu/repo && git fetch origin && git checkout ${{ github.ref_name }} && git pull origin ${{ github.ref_name }}
-          fi
+          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws configure set aws_session_token IQoJb3JpZ2luX2VjEAUaCXVzLXdlc3QtMiJHMEUCIArN/1zu2ThvhAaNsOc3t5GgfocN91Z5uYGNhZAlPs6/AiEA/1792VtZ/Q7D346OX4imX3bvEcB69UJoaMoHOKCkGk4qtwIILhABGgw4MDMyNTM4MDMzNTQiDDMJ89rpbIwYEALHvyqUAlu2bXGtv81s6oor7T6mlDm8hR9LlNpVY5gM2RxcZKk/k2Js9usMMHSeNlB+Xn6s+PkbB4yqXli3XOw0QbaMvz5G9pR8oYY0edf3uEb470Y2P6r0qpn5rQ21QIiENzVcp/5HY9OBA9TThHiyMRX63eixTlf2Lv+UKzLFV+rJAjSiKqdp4XKDcq6PAitBCO8h2DfQ4EMODm4c34WRqy9xqXoO7r5oC0bjNR7C15bob1W0tIjw1fAcJLuJcMCfs8D1kaHjnAinERnq3dVoqKUo1oh7xV7Ky0cg3H3bEtR6eLV9DBMPCUlUKPDJMiyL5rqYUQRT24AbWgjTFC5TlQhHpHmmLDe0E7tx5Kz/ubzsdN+EObaCUDCG/Ly9BjqdAVeT/Sweg1CaMBnq9wGDf7hoQTeanetxkEGKBbjjTvC8JNdstYl942T0hiXOyOqenCMk76MDZ6WN+BC8Yb+yDA2fECs75NyK1tE/eWmdOnFlYpNDoSURgGdrg6V+OP/eeCK7YuScX0aRvpak3jLWe8nh96YjUPCuc5eYbg7URaNqVqpxY98h9Nx47eiEwQxJRJ+AkGhdhQDRkrKPKVA=
+          aws configure set region us-east-1
+          TARGET_GROUP_ARN=$(aws elbv2 describe-target-groups --names chatbot-tg-2000 --query 'TargetGroups[0].TargetGroupArn' --output text)
+          INSTANCE_IDS=$(aws elbv2 describe-target-health --target-group-arn $TARGET_GROUP_ARN --query 'TargetHealthDescriptions[*].Target.Id' --output text)
+          for instance_id in $INSTANCE_IDS; do
+            echo "Deregistering instance $instance_id from target group..."
+            aws elbv2 deregister-targets --target-group-arn $TARGET_GROUP_ARN --targets Id=$instance_id
+          done
 
-          # Diagnosticar el contenido del repositorio
-          echo "Contents of /home/ubuntu/repo:"
-          ls -la /home/ubuntu/repo
+      # Paso 6: Desplegar en la instancia EC2 usando Docker Compose
+      - name: Deploy ms-chatbot to Terraform Instance
+        run: |
+          ssh -o StrictHostKeyChecking=no -i /home/runner/.ssh/terraform_key.pem ubuntu@ec2-54-175-100-230.compute-1.amazonaws.com << 'EOF'
+          # Diagnosticar el contenido del directorio
+          echo "Contents of /home/ubuntu:"
+          ls -la /home/ubuntu
 
           # Verificar e instalar Docker si no está instalado
           if ! command -v docker &> /dev/null; then
@@ -81,97 +84,17 @@ jobs:
             echo "Docker Compose ya está instalado."
           fi
 
-          # Cambiar al directorio del repositorio
-          cd /home/ubuntu/repo
-
-          # Crear archivo docker-compose.yml dinámicamente
+          # Crear archivo docker-compose.yml dinámicamente para ms-chatbot
+          cd /home/ubuntu
           echo "version: '3'" > docker-compose.yml
           echo "services:" >> docker-compose.yml
-          port=8080
-          branch_name=$(echo "${{ github.ref_name }}")
-          for dir in $(ls -d */); do
-            service_name=$(basename "$dir")
-            echo "  $service_name:" >> docker-compose.yml
-            echo "    image: dssanguano/${service_name}:${branch_name}" >> docker-compose.yml
-            echo "    ports:" >> docker-compose.yml
-            echo "      - \"${port}:${port}\"" >> docker-compose.yml
-            port=$((port + 1))
-          done
-
-          # Desplegar con Docker Compose
-          sudo docker-compose down || true
-          sudo docker-compose pull
-          sudo docker-compose up -d
-          EOF
-
-  deploy-dev:
-    if: github.ref_name == 'Dev'
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    steps:
-      # Paso 6: Configurar clave SSH para Dev
-      - name: Set up SSH key for Dev
-        run: |
-          mkdir -p /home/runner/.ssh
-          echo "${{ secrets.DEV_SSH_KEY }}" > /home/runner/.ssh/main_key.pem
-          chmod 600 /home/runner/.ssh/main_key.pem
-
-      # Paso 7: Desplegar en la instancia Dev usando Docker Compose
-      - name: Deploy to Dev Instance
-        run: |
-          ssh -o StrictHostKeyChecking=no -i /home/runner/.ssh/main_key.pem ubuntu@ec2-54-175-100-230.compute-1.amazonaws.com << 'EOF'
-          # Clonar el repositorio en la instancia EC2
-          if [ ! -d "/home/ubuntu/repo" ]; then
-            echo "Cloning repository..."
-            git clone --branch ${{ github.ref_name }} https://github.com/DavidSebas20/domain-security-auth.git /home/ubuntu/repo
-          else
-            echo "Repository already cloned. Pulling latest changes..."
-            cd /home/ubuntu/repo && git fetch origin && git checkout ${{ github.ref_name }} && git pull origin ${{ github.ref_name }}
-          fi
-
-          # Diagnosticar el contenido del repositorio
-          echo "Contents of /home/ubuntu/repo:"
-          ls -la /home/ubuntu/repo
-
-          # Verificar e instalar Docker si no está instalado
-          if ! command -v docker &> /dev/null; then
-            echo "Docker no está instalado. Procediendo a instalar..."
-            sudo apt update
-            sudo apt install -y docker.io
-            sudo systemctl start docker
-            sudo systemctl enable docker
-            sudo usermod -aG docker ubuntu
-            echo "Docker instalado exitosamente."
-          else
-            echo "Docker ya está instalado."
-          fi
-
-          # Verificar e instalar Docker Compose si no está instalado
-          if ! command -v docker-compose &> /dev/null; then
-            echo "Docker Compose no está instalado. Procediendo a instalar..."
-            sudo curl -L "https://github.com/docker/compose/releases/download/v2.20.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-            sudo chmod +x /usr/local/bin/docker-compose
-            echo "Docker Compose instalado exitosamente."
-          else
-            echo "Docker Compose ya está instalado."
-          fi
-
-          # Cambiar al directorio del repositorio
-          cd /home/ubuntu/repo
-
-          # Crear archivo docker-compose.yml dinámicamente
-          echo "version: '3'" > docker-compose.yml
-          echo "services:" >> docker-compose.yml
-          port=8080
-          branch_name=$(echo "${{ github.ref_name }}")
-          for dir in $(ls -d */); do
-            service_name=$(basename "$dir")
-            echo "  $service_name:" >> docker-compose.yml
-            echo "    image: dssanguano/${service_name}:${branch_name}" >> docker-compose.yml
-            echo "    ports:" >> docker-compose.yml
-            echo "      - \"${port}:${port}\"" >> docker-compose.yml
-            port=$((port + 1))
-          done
+          echo "  ms-chatbot:" >> docker-compose.yml
+          echo "    image: dssanguano/ms-chatbot:${{ github.ref_name }}" >> docker-compose.yml
+          echo "    ports:" >> docker-compose.yml
+          echo "      - \"2000:2000\"" >> docker-compose.yml
+          echo "    environment:" >> docker-compose.yml
+          echo "      URL: \"${{ secrets.URL }}\"" >> docker-compose.yml
+          echo "      OPENAI_API_KEY: \"${{ secrets.OPENAI_API_KEY }}\"" >> docker-compose.yml
 
           # Desplegar con Docker Compose
           sudo docker-compose down || true
