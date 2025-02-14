@@ -32,72 +32,45 @@ jobs:
     needs: build-and-push
     runs-on: ubuntu-latest
     steps:
-      # Paso 4: Configurar clave SSH para acceder a la instancia EC2 creada con Terraform
-      - name: Set up SSH key for Terraform Instance
-        run: |
-          mkdir -p /home/runner/.ssh
-          echo "${{ secrets.TERRAFORM_SSH_KEY }}" > /home/runner/.ssh/terraform_key.pem
-          chmod 600 /home/runner/.ssh/terraform_key.pem
-
-      # Paso 5: Eliminar instancias del Target Group
-      - name: Remove Instances from Target Group
+      # Paso 4: Configurar AWS CLI
+      - name: Configure AWS CLI
         run: |
           aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws configure set aws_session_token IQoJb3JpZ2luX2VjEAUaCXVzLXdlc3QtMiJHMEUCIArN/1zu2ThvhAaNsOc3t5GgfocN91Z5uYGNhZAlPs6/AiEA/1792VtZ/Q7D346OX4imX3bvEcB69UJoaMoHOKCkGk4qtwIILhABGgw4MDMyNTM4MDMzNTQiDDMJ89rpbIwYEALHvyqUAlu2bXGtv81s6oor7T6mlDm8hR9LlNpVY5gM2RxcZKk/k2Js9usMMHSeNlB+Xn6s+PkbB4yqXli3XOw0QbaMvz5G9pR8oYY0edf3uEb470Y2P6r0qpn5rQ21QIiENzVcp/5HY9OBA9TThHiyMRX63eixTlf2Lv+UKzLFV+rJAjSiKqdp4XKDcq6PAitBCO8h2DfQ4EMODm4c34WRqy9xqXoO7r5oC0bjNR7C15bob1W0tIjw1fAcJLuJcMCfs8D1kaHjnAinERnq3dVoqKUo1oh7xV7Ky0cg3H3bEtR6eLV9DBMPCUlUKPDJMiyL5rqYUQRT24AbWgjTFC5TlQhHpHmmLDe0E7tx5Kz/ubzsdN+EObaCUDCG/Ly9BjqdAVeT/Sweg1CaMBnq9wGDf7hoQTeanetxkEGKBbjjTvC8JNdstYl942T0hiXOyOqenCMk76MDZ6WN+BC8Yb+yDA2fECs75NyK1tE/eWmdOnFlYpNDoSURgGdrg6V+OP/eeCK7YuScX0aRvpak3jLWe8nh96YjUPCuc5eYbg7URaNqVqpxY98h9Nx47eiEwQxJRJ+AkGhdhQDRkrKPKVA=
           aws configure set region us-east-1
+
+      # Paso 5: Desregistrar y terminar instancias actuales
+      - name: Deregister and Terminate Instances
+        run: |
+          # Obtener el ARN del Target Group
           TARGET_GROUP_ARN=$(aws elbv2 describe-target-groups --names chatbot-tg-2000 --query 'TargetGroups[0].TargetGroupArn' --output text)
+
+          # Obtener las IDs de las instancias registradas en el Target Group
           INSTANCE_IDS=$(aws elbv2 describe-target-health --target-group-arn $TARGET_GROUP_ARN --query 'TargetHealthDescriptions[*].Target.Id' --output text)
+
+          # Desregistrar las instancias del Target Group
           for instance_id in $INSTANCE_IDS; do
             echo "Deregistering instance $instance_id from target group..."
             aws elbv2 deregister-targets --target-group-arn $TARGET_GROUP_ARN --targets Id=$instance_id
           done
 
-      # Paso 6: Desplegar en la instancia EC2 usando Docker Compose
-      - name: Deploy ms-chatbot to Terraform Instance
+          # Terminar las instancias
+          for instance_id in $INSTANCE_IDS; do
+            echo "Terminating instance $instance_id..."
+            aws ec2 terminate-instances --instance-ids $instance_id
+          done
+
+      # Paso 6: Esperar a que el ASG cree nuevas instancias
+      - name: Wait for New Instances
         run: |
-          ssh -o StrictHostKeyChecking=no -i /home/runner/.ssh/terraform_key.pem ubuntu@ec2-54-175-100-230.compute-1.amazonaws.com << 'EOF'
-          # Diagnosticar el contenido del directorio
-          echo "Contents of /home/ubuntu:"
-          ls -la /home/ubuntu
+          # Esperar 2 minutos para que el ASG detecte la falta de instancias y cree nuevas
+          echo "Waiting for new instances to be created by the Auto Scaling Group..."
+          sleep 120
 
-          # Verificar e instalar Docker si no está instalado
-          if ! command -v docker &> /dev/null; then
-            echo "Docker no está instalado. Procediendo a instalar..."
-            sudo apt update
-            sudo apt install -y docker.io
-            sudo systemctl start docker
-            sudo systemctl enable docker
-            sudo usermod -aG docker ubuntu
-            echo "Docker instalado exitosamente."
-          else
-            echo "Docker ya está instalado."
-          fi
-
-          # Verificar e instalar Docker Compose si no está instalado
-          if ! command -v docker-compose &> /dev/null; then
-            echo "Docker Compose no está instalado. Procediendo a instalar..."
-            sudo curl -L "https://github.com/docker/compose/releases/download/v2.20.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-            sudo chmod +x /usr/local/bin/docker-compose
-            echo "Docker Compose instalado exitosamente."
-          else
-            echo "Docker Compose ya está instalado."
-          fi
-
-          # Crear archivo docker-compose.yml dinámicamente para ms-chatbot
-          cd /home/ubuntu
-          echo "version: '3'" > docker-compose.yml
-          echo "services:" >> docker-compose.yml
-          echo "  ms-chatbot:" >> docker-compose.yml
-          echo "    image: dssanguano/ms-chatbot:${{ github.ref_name }}" >> docker-compose.yml
-          echo "    ports:" >> docker-compose.yml
-          echo "      - \"2000:2000\"" >> docker-compose.yml
-          echo "    environment:" >> docker-compose.yml
-          echo "      URL: \"${{ secrets.URL }}\"" >> docker-compose.yml
-          echo "      OPENAI_API_KEY: \"${{ secrets.OPENAI_API_KEY }}\"" >> docker-compose.yml
-
-          # Desplegar con Docker Compose
-          sudo docker-compose down || true
-          sudo docker-compose pull
-          sudo docker-compose up -d
-          EOF
+      # Paso 7: Verificar que las nuevas instancias están registradas
+      - name: Verify New Instances in Target Group
+        run: |
+          TARGET_GROUP_ARN=$(aws elbv2 describe-target-groups --names chatbot-tg-2000 --query 'TargetGroups[0].TargetGroupArn' --output text)
+          NEW_INSTANCE_IDS=$(aws elbv2 describe-target-health --target-group-arn $TARGET_GROUP_ARN --query 'TargetHealthDescriptions[*].Target.Id' --output text)
+          echo "New instances registered in Target Group: $NEW_INSTANCE_IDS"
